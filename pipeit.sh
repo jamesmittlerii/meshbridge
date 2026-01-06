@@ -5,7 +5,7 @@ if [ -f .env ]; then
     export $(grep -v '^#' .env | xargs)
 fi
 
-./decode_new.py | \
+./decode.py | \
 jq -c --unbuffered 'select(.to == "!ffffffff" and .portnum == "NODEINFO_APP")' | \
 while read -r line; do
     # Skip empty lines or lines that don't look like JSON
