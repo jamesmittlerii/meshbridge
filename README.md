@@ -28,22 +28,22 @@ Configuration is handled via a `.env` file (not committed to repo):
 # Remote MQTT (Source)
 MQTT_HOST=mqtt.meshtastic.org
 MQTT_TOPICS=msh/US/UT/2/e/Freq51/#
-MQTT_USERNAME=meshdev
-MQTT_PASSWORD=large4cats
+MQTT_USERNAME=your_remote_user
+MQTT_PASSWORD=your_remote_pass
 
 # Decryption Keys
 # The PSK for the channel you are monitoring (e.g., Freq51)
-MESHTASTIC_PSK=1PG7OiApB1nwvP+rz05p1A==
+MESHTASTIC_PSK=your_base64_psk_here
 
 # Local MQTT (Target)
 # Your local broker that your radio is connected to
-LOCAL_MQTT_HOST=192.168.4.187
-LOCAL_MQTT_USER=mesh
-LOCAL_MQTT_PASS=mesh
+LOCAL_MQTT_HOST=192.168.1.100
+LOCAL_MQTT_USER=local_user
+LOCAL_MQTT_PASS=local_pass
 
 # Injection Target
 # Usually your Radio's ID to force ingestion without broadcast
-LOCAL_MQTT_TOPIC=msh/US/2/e/Freq51/!69854258
+LOCAL_MQTT_TOPIC=msh/US/2/e/Freq51/!12345678
 ```
 
 ## Running
