@@ -1,0 +1,27 @@
+{
+    "raw": "CooBDckuVPcV/////xjzASpYQu8yniKLgKDeQeuBJNjntfC9QImc6SY2DxaX6XccrIZWTnRqoNvJ1H1qGnkFj3ZWiznzCItzUb074Rzem4rRZOHCCxXgblYvHGeFz5ZLlPM58IQ7vce08TU0EMBsPQwqXWlFAAAwQWDL//////////8BeAeYAf4BqAEBEgZGcmVxNTEaCSE5ZWEzZTBlMA==",
+    "from": "!f7542ec9",
+    "to": "!ffffffff",
+    "id": 1824526388,
+    "channel": 243,
+    "hop_limit": null,
+    "hop_start": 7,
+    "rx_time": 1767713292,
+    "rx_snr": 11.0,
+    "rx_rssi": -53,
+    "timestamp": "2026-01-06T07:28:12Z",
+    "channel_id": "Freq51",
+    "gateway_id": "!9ea3e0e0",
+    "encrypted": true,
+    "decrypted": true,
+    "portnum": "NODEINFO_APP",
+    "payload": {
+        "id": "!f7542ec9",
+        "longName": "HarYale_rooftop",
+        "shortName": "HaYa",
+        "macaddr": "xKH3VC7J",
+        "hwModel": "RAK4631",
+        "publicKey": "JhrdquNG08sA4Yla8wVHSW6+c6WfmGOJskDvecl9a24="
+    },
+    "topic": "msh/US/UT/2/e/Freq51/!9ea3e0e0"
+}

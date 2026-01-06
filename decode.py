@@ -1,373 +1,445 @@
 #!/usr/bin/env python3
 """
-Meshtastic MQTT Packet Decoder
-
-Subscribes to MQTT broker and decodes Meshtastic packets.
-Handles encrypted packets with optional PSK.
+Meshtastic MQTT Packet Decoder with JSON output.
+Connects to an MQTT broker, decodes Meshtastic packets, and outputs them as JSON.
 """
 
 import argparse
 import base64
-import sys
+import binascii
 import json
+import sys
+from typing import Optional, Dict, Any
+from datetime import datetime
+
+import paho.mqtt.client as mqtt
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
-import paho.mqtt.client as mqtt
 
-# Import Meshtastic protobuf definitions
 try:
-    from meshtastic import mqtt_pb2, mesh_pb2, portnums_pb2
+    from meshtastic.protobuf import mqtt_pb2, mesh_pb2, portnums_pb2
 except ImportError:
     print("Error: meshtastic package not found. Install with: pip install meshtastic", file=sys.stderr)
     sys.exit(1)
 
 
-def parse_psk(psk_string):
+def parse_psk(psk_string: str) -> Optional[bytes]:
     """
-    Parse PSK from various formats: base64, hex (0x...), or plain hex.
-    Returns bytes or None if parsing fails.
+    Parse a PSK from hex or base64 format.
+    
+    Args:
+        psk_string: PSK as hex (with or without 0x prefix) or base64
+        
+    Returns:
+        PSK as bytes, or None if parsing fails
     """
     if not psk_string:
         return None
+        
+    s = psk_string.strip()
     
-    try:
-        # Try hex with 0x prefix
-        if psk_string.startswith('0x') or psk_string.startswith('0X'):
-            return bytes.fromhex(psk_string[2:])
-        
-        # Try plain hex (common for Meshtastic)
+    # Try hex first
+    if s.startswith("0x") or s.startswith("0X"):
+        s = s[2:]
+    
+    # Check if it looks like hex
+    if all(c in "0123456789abcdefABCDEF" for c in s) and len(s) % 2 == 0:
         try:
-            return bytes.fromhex(psk_string)
-        except ValueError:
+            return binascii.unhexlify(s)
+        except Exception:
             pass
-        
-        # Try base64
-        return base64.b64decode(psk_string)
+    
+    # Handle Meshtastic MQTT encryption key substitution
+    # When mqtt.encryption_enabled is true, 1-byte PSKs are replaced with the MQTT encryption key
+    # The pattern is: take the MQTT base key and replace the last byte with the PSK byte
+    if len(s) <= 4 and base64.b64decode(s.strip()) and len(base64.b64decode(s.strip())) == 1:
+        # This is a 1-byte PSK - use MQTT encryption key pattern
+        psk_byte = base64.b64decode(s.strip())[0]
+        # Base MQTT key: 1PG7OiApB1nwvP+rz05pAQ== but with last byte replaced
+        mqtt_key_base = base64.b64decode('1PG7OiApB1nwvP+rz05pAQ==')
+        mqtt_key = mqtt_key_base[:-1] + bytes([psk_byte])
+        s = base64.b64encode(mqtt_key).decode('ascii')
+        print(f"INFO: Substituting 1-byte PSK with MQTT encryption key", file=sys.stderr)
+    
+    # Try base64
+    try:
+        return base64.b64decode(s)
     except Exception as e:
         print(f"Warning: Failed to parse PSK: {e}", file=sys.stderr)
         return None
 
 
-def decrypt_packet(encrypted_data, packet_id, from_node, psk):
+def decrypt_packet(encrypted_data: bytes, packet_id: int, from_node: int, psk: bytes) -> Optional[bytes]:
     """
-    Decrypt Meshtastic packet using AES-CTR with channel PSK.
+    Decrypt an encrypted Meshtastic packet using AES-CTR.
+    Tries multiple IV permutations to handle different firmware versions.
     
-    Meshtastic uses AES-256-CTR with a nonce derived from:
-    - packet_id (4 bytes)
-    - from_node (4 bytes)
-    - Padded to 16 bytes with zeros
+    Args:
+        encrypted_data: The encrypted payload
+        packet_id: Packet ID
+        from_node: Sender node ID
+        psk: Pre-shared key (as-is, no padding)
+        
+    Returns:
+        Decrypted data as bytes, or None if decryption fails
     """
-    if not psk or len(psk) == 0:
+    if not encrypted_data or not psk:
         return None
     
-    try:
-        # Ensure PSK is 32 bytes (AES-256), pad or truncate if needed
-        # Note: Meshtastic typically uses "AQ==" (base64 for 0x01) as default key
-        key = psk.ljust(32, b'\x00')[:32]
-        
-        # Construct nonce: packet_id (4) + from_node (4) + padding (8)
-        nonce = packet_id.to_bytes(4, 'little') + from_node.to_bytes(4, 'little') + b'\x00' * 8
-        
-        # Decrypt using AES-256-CTR
-        cipher = Cipher(algorithms.AES(key), modes.CTR(nonce), backend=default_backend())
-        decryptor = cipher.decryptor()
-        decrypted = decryptor.update(encrypted_data) + decryptor.finalize()
-        
-        return decrypted
-    except Exception as e:
-        print(f"  Decryption failed: {e}", file=sys.stderr)
-        return None
-
-
-def format_node_id(node_id):
-    """Format node ID as Meshtastic-style hex: !69854258"""
-    if isinstance(node_id, str):
-        # Already formatted or needs parsing
-        if node_id.startswith('!'):
-            return node_id
-        # Try to parse as hex string
+    # Pad short keys to minimum AES key size (16 bytes for AES-128)
+    if len(psk) < 16:
+        psk = psk + b'\x00' * (16 - len(psk))
+        print(f"DEBUG: Padded PSK to {len(psk)} bytes: {psk.hex()}", file=sys.stderr)
+    
+    # Use PSK as-is (no padding) - AES will work with 1-byte, 16-byte, or 32-byte keys
+    # Generate candidate IVs (nonces) - different firmware versions use different layouts
+    packet_id_bytes_le = packet_id.to_bytes(8, byteorder='little')
+    packet_id_bytes_be = packet_id.to_bytes(8, byteorder='big')
+    from_node_bytes_le = from_node.to_bytes(8, byteorder='little')
+    from_node_bytes_be = from_node.to_bytes(8, byteorder='big')
+    
+    candidates = [
+        packet_id_bytes_le[:4] + from_node_bytes_le[:4] + b'\x00' * 8,
+        packet_id_bytes_be[:4] + from_node_bytes_be[:4] + b'\x00' * 8,
+        packet_id_bytes_le + from_node_bytes_le,
+        packet_id_bytes_be + from_node_bytes_be,
+        from_node_bytes_le + packet_id_bytes_le,
+        from_node_bytes_be + packet_id_bytes_be,
+    ]
+    
+    # Try each IV candidate
+    for nonce in candidates:
         try:
-            node_id = int(node_id, 16)
-        except ValueError:
-            return node_id
+            cipher = Cipher(
+                algorithms.AES(psk),
+                modes.CTR(nonce),
+                backend=default_backend()
+            )
+            decryptor = cipher.decryptor()
+            decrypted = decryptor.update(encrypted_data) + decryptor.finalize()
+            
+            # Validate by trying to parse as Data protobuf
+            try:
+                data = mesh_pb2.Data()
+                data.ParseFromString(decrypted)
+                return decrypted
+            except Exception:
+                continue
+                
+        except Exception:
+            continue
+    
+    return None
+
+
+def format_node_id(node_id: int) -> str:
+    """Format a node ID as !hex string."""
     return f"!{node_id:08x}"
 
 
-def decode_meshtastic_packet(payload, psk=None):
-    """
-    Decode a Meshtastic ServiceEnvelope from MQTT payload.
-    Returns a dict with decoded information or None on failure.
-    """
+def get_portnum_name(portnum: int) -> str:
+    """Get the human-readable name for a portnum."""
     try:
-        # Parse the ServiceEnvelope (outer MQTT wrapper)
+        return portnums_pb2.PortNum.Name(portnum)
+    except Exception:
+        return f"UNKNOWN_{portnum}"
+
+
+def extract_encrypted_bytes(packet) -> Optional[bytes]:
+    """Extract encrypted bytes from a packet, handling different field names."""
+    enc = getattr(packet, 'encrypted', None)
+    if enc:
+        if isinstance(enc, (bytes, bytearray)):
+            return bytes(enc)
+        if hasattr(enc, 'payload'):
+            return enc.payload
+        if hasattr(enc, 'ciphertext'):
+            return enc.ciphertext
+    return None
+
+
+def pkt_from(pkt) -> int:
+    """Extract 'from' field, handling both 'from' and 'from_' field names."""
+    return getattr(pkt, 'from', None) or getattr(pkt, 'from_', 0)
+
+
+def pkt_to(pkt) -> int:
+    """Extract 'to' field."""
+    return getattr(pkt, 'to', 0)
+
+
+def decode_packet_to_json(payload: bytes, psk: Optional[bytes]) -> Optional[Dict[str, Any]]:
+    """
+    Decode a Meshtastic packet payload and return as a JSON-serializable dict.
+    
+    Args:
+        payload: Raw MQTT payload bytes
+        psk: Optional decryption key
+        
+    Returns:
+        Dictionary containing decoded packet data, or None if parsing fails
+    """
+    # Try to parse as ServiceEnvelope first
+    envelope = None
+    packet = None
+    
+    try:
+        # Debug: Print raw payload in base64
+        import base64
+        # print(f"DEBUG: RAW_PAYLOAD_B64: {base64.b64encode(payload).decode('ascii')}", file=sys.stderr)
+        
         envelope = mqtt_pb2.ServiceEnvelope()
         envelope.ParseFromString(payload)
+        if envelope.HasField('packet'):
+            packet = envelope.packet
+    except Exception:
+        pass
+    
+    # Fall back to direct MeshPacket parsing
+    if not packet:
+        try:
+            packet = mesh_pb2.MeshPacket()
+            packet.ParseFromString(payload)
+        except Exception:
+            return None
+    
+    if not packet:
+        return None
+    
+    # Build result dictionary
+    result: Dict[str, Any] = {
+        'raw': base64.b64encode(payload).decode('ascii'),
+        'from': format_node_id(pkt_from(packet)),
+        'to': format_node_id(pkt_to(packet)),
+        'id': packet.id if packet.id else None,
+        'channel': packet.channel if packet.channel else 0,
+        'hop_limit': packet.hop_limit if packet.hop_limit else None,
+        'hop_start': packet.hop_start if packet.hop_start else None,
+        'rx_time': packet.rx_time if packet.rx_time else None,
+        'rx_snr': packet.rx_snr if packet.rx_snr else None,
+        'rx_rssi': packet.rx_rssi if packet.rx_rssi else None,
+    }
+    
+    # Add timestamp if available
+    if packet.rx_time:
+        result['timestamp'] = datetime.fromtimestamp(packet.rx_time).isoformat() + 'Z'
+    
+    # Add envelope metadata if available
+    if envelope:
+        if envelope.channel_id:
+            result['channel_id'] = envelope.channel_id
+        if envelope.gateway_id:
+            result['gateway_id'] = envelope.gateway_id
+    
+    # Handle encrypted or decoded data
+    encrypted_bytes = extract_encrypted_bytes(packet)
+    
+    if encrypted_bytes and psk:
+        # Debug output
+        # print(f"DEBUG: Encrypted payload hex: {encrypted_bytes.hex()}", file=sys.stderr)
+        # print(f"DEBUG: PSK hex: {psk.hex()}", file=sys.stderr)
+        # print(f"DEBUG: Packet ID: {packet.id}, From: {pkt_from(packet):08x}", file=sys.stderr)
         
-        # Extract the MeshPacket
-        packet = envelope.packet
+        # Attempt decryption
+        decrypted = decrypt_packet(encrypted_bytes, packet.id, pkt_from(packet), psk)
         
-        # Note: 'from' is a Python keyword, so we use getattr() to access the protobuf field
-        # These should be uint32 values in the protobuf
-        from_id = getattr(packet, 'from', 0)
-        to_id = getattr(packet, 'to', 0xffffffff)
-        
-        # Ensure they are integers (protobuf should return int, but be defensive)
-        if not isinstance(from_id, int):
+        if decrypted:
             try:
-                from_id = int(from_id)
-            except (ValueError, TypeError):
-                from_id = 0
-        if not isinstance(to_id, int):
-            try:
-                to_id = int(to_id)
-            except (ValueError, TypeError):
-                to_id = 0xffffffff
-        
-        # Debug: if from_id is 0, print packet info to help diagnose
-        if from_id == 0:
-            print(f"  DEBUG: from_id is 0. Packet fields: {packet.ListFields()[:5]}", file=sys.stderr)
-        
-        result = {
-            'from': format_node_id(from_id),
-            'to': format_node_id(to_id),
-            'channel': envelope.channel_id,  # Scalar field, no HasField() needed
-            'gateway': format_node_id(envelope.gateway_id) if envelope.gateway_id else None,
-        }
-        
-        # Check if packet is encrypted
-        if packet.HasField('encrypted') and len(packet.encrypted) > 0:
-            if psk:
-                # Attempt decryption
-                decrypted = decrypt_packet(
-                    packet.encrypted,
-                    packet.id,
-                    from_id,  # Use the from_id we extracted earlier
-                    psk
-                )
+                data = mesh_pb2.Data()
+                data.ParseFromString(decrypted)
                 
-                if decrypted:
-                    # Parse decrypted Data protobuf
-                    try:
-                        data = mesh_pb2.Data()
-                        data.ParseFromString(decrypted)
-                        result['encrypted'] = True
-                        result['data'] = data
-                    except Exception as e:
-                        # Decryption produced data but it's not valid protobuf
-                        # This likely means wrong PSK or corrupted packet
-                        result['encrypted'] = True
-                        result['decrypt_failed'] = True
-                        result['error'] = f'Decryption succeeded but Data parse failed: {e}'
-                        result['decrypted_hex'] = decrypted[:32].hex() + ('...' if len(decrypted) > 32 else '')
-                        return result
-                else:
-                    result['encrypted'] = True
-                    result['decrypt_failed'] = True
-                    return result
-            else:
                 result['encrypted'] = True
-                result['no_psk'] = True
-                return result
-        elif packet.HasField('decoded'):
-            # Packet is already decoded
-            result['encrypted'] = False
-            result['data'] = packet.decoded
+                result['decrypted'] = True
+                result['portnum'] = get_portnum_name(data.portnum)
+                
+                # Extract payload based on type
+                if result['portnum'] == 'NODEINFO_APP':
+                    try:
+                        user = mesh_pb2.User()
+                        user.ParseFromString(data.payload)
+                        # Create a serializable dictionary
+                        user_dict = {
+                            'id': user.id,
+                            'longName': user.long_name,
+                            'shortName': user.short_name,
+                            'macaddr': base64.b64encode(user.macaddr).decode('ascii') if user.macaddr else None,
+                            'hwModel': mesh_pb2.HardwareModel.Name(user.hw_model),
+                            'publicKey': base64.b64encode(user.public_key).decode('ascii') if user.public_key else None,
+                        }
+                        result['payload'] = user_dict
+                    except Exception as e:
+                         result['payload'] = f"Failed to parse NodeInfo: {e}"
+                elif data.portnum == portnums_pb2.TEXT_MESSAGE_APP:
+                    try:
+                        result['payload'] = data.payload.decode('utf-8', errors='replace')
+                    except Exception:
+                        result['payload'] = base64.b64encode(data.payload).decode('ascii')
+                else:
+                    result['payload'] = base64.b64encode(data.payload).decode('ascii')
+                    
+            except Exception as e:
+                result['encrypted'] = True
+                result['decrypted'] = False
+                result['error'] = f"Failed to parse decrypted data: {e}"
         else:
-            result['error'] = 'No payload (neither encrypted nor decoded)'
-            return result
-        
-        # Decode the Data protobuf payload if present
-        if 'data' in result:
-            data = result['data']
-            result['portnum'] = portnums_pb2.PortNum.Name(data.portnum) if data.portnum else 'UNKNOWN'
+            result['encrypted'] = True
+            result['decrypted'] = False
+            result['error'] = "Decryption failed"
             
-            # Decode specific payload types
-            if data.portnum == portnums_pb2.PortNum.TEXT_MESSAGE_APP:
-                result['text'] = data.payload.decode('utf-8', errors='replace')
-            elif data.portnum == portnums_pb2.PortNum.POSITION_APP:
-                pos = mesh_pb2.Position()
-                pos.ParseFromString(data.payload)
-                result['position'] = {
-                    'lat': pos.latitude_i * 1e-7 if pos.latitude_i else None,
-                    'lon': pos.longitude_i * 1e-7 if pos.longitude_i else None,
-                    'alt': pos.altitude if pos.altitude else None,
-                }
-            elif data.portnum == portnums_pb2.PortNum.NODEINFO_APP:
-                nodeinfo = mesh_pb2.User()
-                nodeinfo.ParseFromString(data.payload)
-                result['nodeinfo'] = {
-                    'id': nodeinfo.id if nodeinfo.id else None,
-                    'longname': nodeinfo.long_name if nodeinfo.long_name else None,
-                    'shortname': nodeinfo.short_name if nodeinfo.short_name else None,
-                }
-            elif data.portnum == portnums_pb2.PortNum.TELEMETRY_APP:
-                telemetry = mesh_pb2.Telemetry()
-                telemetry.ParseFromString(data.payload)
-                result['telemetry'] = {}
-                if telemetry.HasField('device_metrics'):
-                    result['telemetry']['battery'] = telemetry.device_metrics.battery_level
-                if telemetry.HasField('environment_metrics'):
-                    result['telemetry']['temp'] = telemetry.environment_metrics.temperature
-            else:
-                # Unknown portnum, show raw hex
-                result['payload_hex'] = data.payload.hex() if data.payload else None
+    elif packet.HasField('decoded'):
+        # Already decoded packet
+        data = packet.decoded
+        result['encrypted'] = False
+        result['portnum'] = get_portnum_name(data.portnum)
         
-        return result
-        
-    except Exception as e:
-        return {'error': f'Decode error: {e}'}
-
-
-def print_packet(topic, packet_info):
-    """Print decoded packet information in a readable format."""
-    print(f"\n{'='*80}")
-    print(f"Topic: {topic}")
-    
-    # Header line with from/to
-    from_id = packet_info.get('from', '!unknown')
-    to_id = packet_info.get('to', '!unknown')
-    channel = packet_info.get('channel', 0)
-    gateway = packet_info.get('gateway')
-    
-    header = f"From: {from_id} → To: {to_id} | Channel: {channel}"
-    if gateway:
-        header += f" | Gateway: {gateway}"
-    print(header)
-    
-    # Handle errors
-    if 'error' in packet_info:
-        print(f"  Error: {packet_info['error']}")
-        # Show decrypted hex if present (helps diagnose wrong PSK)
-        if 'decrypted_hex' in packet_info:
-            print(f"  Decrypted data (likely wrong PSK): {packet_info['decrypted_hex']}")
-        return
-    
-    # Encryption status
-    if packet_info.get('encrypted'):
-        if packet_info.get('decrypt_failed'):
-            print("  [ENCRYPTED - Decryption failed]")
-            if 'decrypted_hex' in packet_info:
-                print(f"  Decrypted data (likely wrong PSK): {packet_info['decrypted_hex']}")
-            return
-        elif packet_info.get('no_psk'):
-            print("  [ENCRYPTED - No PSK provided]")
-            return
+        if result['portnum'] == 'NODEINFO_APP':
+            try:
+                user = mesh_pb2.User()
+                user.ParseFromString(data.payload)
+                # Create a serializable dictionary
+                user_dict = {
+                    'id': user.id,
+                    'longName': user.long_name,
+                    'shortName': user.short_name,
+                    'macaddr': base64.b64encode(user.macaddr).decode('ascii') if user.macaddr else None,
+                    'hwModel': mesh_pb2.HardwareModel.Name(user.hw_model),
+                    'publicKey': base64.b64encode(user.public_key).decode('ascii') if user.public_key else None,
+                }
+                result['payload'] = user_dict
+            except Exception as e:
+                    result['payload'] = f"Failed to parse NodeInfo: {e}"
+        elif data.portnum == portnums_pb2.TEXT_MESSAGE_APP:
+            try:
+                result['payload'] = data.payload.decode('utf-8', errors='replace')
+            except Exception:
+                result['payload'] = base64.b64encode(data.payload).decode('ascii')
         else:
-            print("  [ENCRYPTED - Decrypted successfully]")
-    
-    # Port number
-    portnum = packet_info.get('portnum', 'UNKNOWN')
-    print(f"  PortNum: {portnum}")
-    
-    # Payload-specific information
-    if 'text' in packet_info:
-        print(f"  Text: {packet_info['text']}")
-    elif 'position' in packet_info:
-        pos = packet_info['position']
-        print(f"  Position: lat={pos['lat']}, lon={pos['lon']}, alt={pos['alt']}")
-    elif 'nodeinfo' in packet_info:
-        info = packet_info['nodeinfo']
-        print(f"  NodeInfo: {info['longname']} ({info['shortname']}) - {info['id']}")
-    elif 'telemetry' in packet_info:
-        telem = packet_info['telemetry']
-        print(f"  Telemetry: {telem}")
-    elif 'payload_hex' in packet_info:
-        payload_hex = packet_info['payload_hex']
-        preview = payload_hex[:64] + ('...' if len(payload_hex) > 64 else '')
-        print(f"  Payload (hex): {preview}")
-
-
-def on_connect(client, userdata, flags, rc):
-    """MQTT connection callback."""
-    if rc == 0:
-        print("Connected to MQTT broker successfully")
-        topics = userdata['topics']
-        for topic in topics:
-            client.subscribe(topic)
-            print(f"Subscribed to: {topic}")
+            result['payload'] = base64.b64encode(data.payload).decode('ascii')
     else:
-        print(f"Connection failed with code {rc}", file=sys.stderr)
-        sys.exit(1)
+        result['encrypted'] = bool(encrypted_bytes)
+        result['decrypted'] = False
+        if not psk and encrypted_bytes:
+            result['error'] = "No PSK provided for encrypted packet"
+    
+    return result
+
+
+def on_connect(client, userdata, flags, reason_code, properties):
+    """MQTT connect callback (v2 API)."""
+    topics = userdata['topics']
+    print(f"INFO: Connected (rc={reason_code}). Subscribing to: {topics}", file=sys.stderr)
+    for topic in topics:
+        client.subscribe(topic)
+
+
+def on_disconnect(client, userdata, flags, reason_code, properties):
+    """MQTT disconnect callback (v2 API)."""
+    if reason_code != 0:
+        print(f"WARN: Unexpected disconnection (code {reason_code}). Reconnecting...", file=sys.stderr)
 
 
 def on_message(client, userdata, msg):
-    """MQTT message callback - decode and print each packet."""
+    """MQTT message callback."""
     psk = userdata.get('psk')
     
+    result = decode_packet_to_json(msg.payload, psk)
+    
+    if result:
+        # Add topic to output
+        result['topic'] = msg.topic
+        # Output as JSON to stdout (flushed immediately)
+        # Use simple format (not indented) for easier line-processing if desired, 
+        # or keep indent=2 for readability. User likely wants line-based JSON for piping usually,
+        # but indent is fine if jq handles it.
+        print(json.dumps(result, indent=2), file=sys.stdout, flush=True)
+    else:
+        print(json.dumps({
+            'topic': msg.topic,
+            'error': 'Failed to parse packet',
+            'payload_length': len(msg.payload)
+        }), file=sys.stderr)
+
+
+def load_env_file():
+    """Simple .env file loader."""
+    env_vars = {}
     try:
-        packet_info = decode_meshtastic_packet(msg.payload, psk)
-        if packet_info:
-            print_packet(msg.topic, packet_info)
-        else:
-            print(f"\nTopic: {msg.topic}")
-            print("  Error: Failed to decode packet (returned None)")
-    except Exception as e:
-        # Never crash - print error and continue
-        print(f"\nTopic: {msg.topic}")
-        print(f"  Error: Unexpected exception: {e}")
-
-
-def on_disconnect(client, userdata, rc):
-    """MQTT disconnect callback."""
-    if rc != 0:
-        print(f"Unexpected disconnection (code {rc}). Reconnecting...", file=sys.stderr)
-
+        with open('.env', 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    env_vars[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    return env_vars
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Decode Meshtastic MQTT packets from Mosquitto broker',
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+    """Main entry point."""
+    # Load environment variables
+    env = load_env_file()
     
-    # Required arguments
-    parser.add_argument('--host', required=True, help='MQTT broker hostname or IP')
-    parser.add_argument('--topic', action='append', required=True, 
-                       help='MQTT topic to subscribe to (can specify multiple times)')
+    parser = argparse.ArgumentParser(description='Meshtastic MQTT Packet Decoder (JSON output)')
+    parser.add_argument('--host', default=env.get('MQTT_HOST'), help='MQTT broker host')
+    parser.add_argument('--port', type=int, default=int(env.get('MQTT_PORT', 1883)), help='MQTT broker port')
     
-    # Optional arguments
-    parser.add_argument('--port', type=int, default=1883, help='MQTT broker port (default: 1883)')
-    parser.add_argument('--user', help='MQTT username for authentication')
-    parser.add_argument('--password', help='MQTT password for authentication')
-    parser.add_argument('--psk', help='Channel PSK for decryption (base64, hex, or 0x-prefixed hex)')
+    # Handle topics default
+    default_topics = env.get('MQTT_TOPICS', '').split(',') if env.get('MQTT_TOPICS') else None
+    parser.add_argument('--topic', action='append', dest='topics', default=default_topics,
+                        help='MQTT topic to subscribe to (can be specified multiple times)')
+                        
+    parser.add_argument('--psk', default=env.get('MESHTASTIC_PSK'), help='Pre-shared key for decryption (hex or base64)')
+    parser.add_argument('--username', default=env.get('MQTT_USERNAME'), help='MQTT username')
+    parser.add_argument('--password', default=env.get('MQTT_PASSWORD'), help='MQTT password')
     
     args = parser.parse_args()
     
-    # Parse PSK if provided
-    psk = parse_psk(args.psk) if args.psk else None
-    if args.psk and psk is None:
-        print("Warning: PSK provided but could not be parsed", file=sys.stderr)
+    # Validate required args if not supplied via env or cli
+    if not args.host:
+        parser.error("--host is required (or set MQTT_HOST in .env)")
+    if not args.topics:
+        parser.error("--topic is required (or set MQTT_TOPICS in .env)")
     
-    # Create MQTT client
-    client = mqtt.Client(userdata={
-        'topics': args.topic,
-        'psk': psk
-    })
+    # Parse PSK if provided
+    psk = None
+    if args.psk:
+        psk = parse_psk(args.psk)
+        if not psk:
+            print("Error: Invalid PSK format", file=sys.stderr)
+            sys.exit(1)
+    
+    # Create MQTT client with v2 callback API
+    client = mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        userdata={
+            'topics': args.topics,
+            'psk': psk
+        }
+    )
     
     # Set callbacks
     client.on_connect = on_connect
     client.on_message = on_message
     client.on_disconnect = on_disconnect
     
-    # Set authentication if provided
-    if args.user and args.password:
-        client.username_pw_set(args.user, args.password)
+    # Set credentials if provided
+    if args.username:
+        client.username_pw_set(args.username, args.password)
     
-    # Connect to broker
-    print(f"Connecting to MQTT broker at {args.host}:{args.port}...")
+    # Connect and loop
     try:
-        client.connect(args.host, args.port, keepalive=60)
-    except Exception as e:
-        print(f"Error connecting to broker: {e}", file=sys.stderr)
-        sys.exit(1)
-    
-    # Start the MQTT loop (blocking)
-    print("Listening for messages... (Ctrl+C to exit)")
-    try:
+        print(f"INFO: Connecting to {args.host}:{args.port}...", file=sys.stderr)
+        client.connect(args.host, args.port, 60)
         client.loop_forever()
     except KeyboardInterrupt:
-        print("\nExiting...")
+        print("\nINFO: Disconnecting...", file=sys.stderr)
         client.disconnect()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
