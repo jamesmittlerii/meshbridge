@@ -39,7 +39,8 @@ def main():
     client.register_callback('PRIVATE_APP', on_json)
     client.register_callback('NODEINFO_APP', on_json)
     # NODEINFO_APP,PRIVATE_APP,REPLY_APP,TEXT_MESSAGE_APP
-    client.filters = "PRIVATE_APP,NODEINFO_APP,REPLY_APP,TEXT_MESSAGE_APP"
+    #client.filters = "PRIVATE_APP,NODEINFO_APP,REPLY_APP,TEXT_MESSAGE_APP"
+    client.filters = "TEXT_MESSAGE_APP"
         
     # Connect and start listening
     #print(f"Connecting to {args.host}:{args.port}...")
